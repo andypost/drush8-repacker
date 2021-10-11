@@ -8,6 +8,7 @@ $version = '8.4.8';
 
 $options = [
   'backup' => ['b' => TRUE],
+  'compress' => ['c' => FALSE],
   'download' => ['d' => TRUE],
   'file::' => ['f::' => 'drush.phar'],
   'hash::' => ['h::' => $hash = 'sha512'],
@@ -15,6 +16,7 @@ $options = [
   'url::' => ['u::' => "https://github.com/drush-ops/drush/releases/download/$version/drush.phar"],
   'verbose' => ['v' => FALSE],
   'write' => ['w' => FALSE],
+  // @todo make clean-up configureable.
   'exclude' => ['x' => TRUE],
 ];
 
@@ -24,12 +26,16 @@ array_walk($options, function (&$value, $long) {
   $input = getopt($short, [$long]);
   $key = rtrim($long, ':');
   $value = $input[$key] ?? $input[rtrim($short, ':')] ?? NULL;
-  if (str_ends_with($short, ':')) $value = $value ?? $default;
+  if (str_ends_with($short, ':')) {
+    $value = $value ?? $default;
+  }
   // Process flags.
-  else $value = isset($value) ? !$default : $default;
+  else {
+    $value = isset($value) ? !$default : $default;
+  }
 });
 
-$phar = $options['file::'];
+$phar = realpath($options['file::']);
 $src = $options['url::'];
 
 // Disable backup.
@@ -37,11 +43,14 @@ $opt_backup = $options['backup'];
 // Disable download.
 $opt_download = $options['download'];
 // Enable compression.
-$opt_compress = $options['compress'] ?? FALSE;
+$opt_compress = $options['compress'];
 // Disable minify.
 $opt_minify = $options['exclude'];
 // Disable patching.
 $opt_patch = $options['input::'] ?? TRUE;
+if ($opt_patch) {
+  $input = $options['input::'] ?? $input;
+}
 // Show unchanged.
 //$opt_unchanged = !($opts['u'] ?? TRUE);
 // Enable verbose.
@@ -51,14 +60,13 @@ $opt_write = $options['write'];
 
 my_msg("Analizing $phar");
 $flip = [TRUE => 'yes', FALSE => 'no'];
-my_msg("- download: " . $flip[$opt_download]);
-my_msg("- backup: " . $flip[$opt_backup]);
-my_msg("- patch: " . $flip[$opt_patch ? TRUE : FALSE]);
-my_msg("- minify: " . $flip[$opt_minify]);
-//my_msg("- unchanged: " . $flip[$opt_unchanged]);
-my_msg("- verbose: " . $flip[$opt_verbose]);
-//my_msg("- compress (broken): " . $flip[$opt_compress]);
-my_msg("- write: " . $flip[$opt_write]);
+my_msg("- (d)ownload: " . $flip[$opt_download]);
+my_msg("- (b)ackup: " . $flip[$opt_backup]);
+my_msg("- (i)nclude: " . $flip[$opt_patch ? TRUE : FALSE]) . ($opt_patch ? " ($input)" : '');
+my_msg("- (m)inify: " . $flip[$opt_minify]);
+my_msg("- (v)erbose: " . $flip[$opt_verbose]);
+my_msg("- (c)ompress: " . $flip[$opt_compress]);
+my_msg("- (w)rite: " . $flip[$opt_write]);
 
 
 if ($opt_write && !\Phar::canWrite()) {
@@ -78,8 +86,8 @@ if ($opt_download && !file_exists($phar)) {
   my_msg("ok");
 }
 
-$backup = "$phar.bak";
 if ($opt_backup) {
+  $backup = "$phar.bak";
   echo "Backup of $phar to $backup ...";
   if (file_exists($backup)) {
     my_msg("skipped as exists");
@@ -94,6 +102,7 @@ if ($opt_backup) {
   }
 }
 
+// @todo accept as -e(--exclude) option.
 $cleanup = [
   'README.md',
   'drush.api.php',
@@ -151,13 +160,13 @@ $counters = [
 foreach ($files as $file) {
   $counters['all']++;
   if ($replace && in_array($file, $replace, TRUE)) {
-    my_replace($file);
+    my_replace($handle, $file, $hash, $input, $opt_write);
     $counters['add']++;
-    continue;
   }
+  // Allow added files to be excluded.
   foreach ($cleanup as $prefix) {
     if (str_starts_with($file, $prefix)) {
-      my_delete($file);
+      my_delete($handle, $file, $opt_minify, $opt_write);
       $counters['del']++;
       continue 2;
     }
@@ -170,10 +179,10 @@ array_walk($counters, function ($value, $key) {
 if ($opt_compress) {
   echo "Compressing with GZ...";
   if ($opt_write) {
-    if ($handle->convertToExecutable(NULL, \Phar::GZ, '.phar.gz')) {
-      my_msg("Compressed with GZ (broken right now)");
-    }
-    else {
+    try {
+      $handle->compressFiles(\Phar::GZ);
+      my_msg("Compressed with GZ");
+    } catch (\BadMethodCallException $e) {
       my_fail("Failed to compress with GZ");
     }
   }
@@ -199,16 +208,13 @@ function my_fail($string) {
   die(1);
 }
 
-function my_replace($file) {
-  global $phar, $input, $hash, $opt_write;
-  $target = "phar://$phar/$file";
-  $old = file_get_contents($target);
-  $old_hash = hash($hash, $old);
-  $new = file_get_contents("$input/$file");
-  $new_hash = hash($hash, $new);
+function my_replace($handle, $file, $hash, $input, $opt_write) {
+  $old_hash = isset($handle[$file]) ? \hash($hash, $handle->offsetGet($file)) : 'no';
+  $new = \file_get_contents("$input/$file");
+  $new_hash = \hash($hash, $new);
   if ($old_hash !== $new_hash) {
     if ($opt_write) {
-      if (file_put_contents($target, $new)) {
+      if ($handle->offsetSet($file, $new)) {
         my_info("+ $file");
       }
       else {
@@ -227,12 +233,10 @@ function my_replace($file) {
   }
 }
 
-function my_delete($file) {
-  global $phar, $opt_minify, $opt_write;
+function my_delete($handle, $file, $opt_minify, $opt_write) {
   if ($opt_minify) {
     if ($opt_write) {
-      $target = "phar://$phar/$file";
-      if (unlink($target)) {
+      if ($handle->delete($file)) {
         my_info("- $file");
       }
       else {
